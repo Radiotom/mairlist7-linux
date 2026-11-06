@@ -1,0 +1,849 @@
+diff --git a/unixlib.c b/unixlib.c
+index 9d00bd6..36040b5 100644
+--- a/unixlib.c
++++ b/unixlib.c
+@@ -28,6 +28,55 @@ static inline void *ULongToPtr(uint32_t ul)
+     return (void *)(uint64_t)ul;
+ }
+ 
++/* ---- WoW64-Handle-Tabelle (mAirList-Patch) ---- */
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#define H32_MAX  256
++#define H32_BASE 0x1000u
++static FT_HANDLE h32_table[H32_MAX];
++static pthread_mutex_t h32_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static uint32_t h32_put(FT_HANDLE h)
++{
++    uint32_t i, ret = 0;
++    if (!h) return 0;
++    pthread_mutex_lock(&h32_lock);
++    for (i = 0; i < H32_MAX; i++)
++        if (h32_table[i] == h) { ret = H32_BASE + i; goto out; }
++    for (i = 0; i < H32_MAX; i++)
++        if (!h32_table[i]) { h32_table[i] = h; ret = H32_BASE + i; goto out; }
++out:
++    pthread_mutex_unlock(&h32_lock);
++    return ret;
++}
++
++static FT_HANDLE h32_get(uint32_t v)
++{
++    FT_HANDLE h = NULL;
++    if (v < H32_BASE || v >= H32_BASE + H32_MAX) return NULL;
++    pthread_mutex_lock(&h32_lock);
++    h = h32_table[v - H32_BASE];
++    pthread_mutex_unlock(&h32_lock);
++    return h;
++}
++
++static void h32_del(uint32_t v)
++{
++    if (v < H32_BASE || v >= H32_BASE + H32_MAX) return;
++    pthread_mutex_lock(&h32_lock);
++    h32_table[v - H32_BASE] = NULL;
++    pthread_mutex_unlock(&h32_lock);
++}
++
++/* 32-Bit-Layout von FT_DEVICE_LIST_INFO_NODE */
++typedef struct {
++    DWORD Flags; DWORD Type; DWORD ID; DWORD LocId;
++    char SerialNumber[16]; char Description[64];
++    uint32_t ftHandle;
++} FT_DEVICE_LIST_INFO_NODE32;
++/* ---- Ende Handle-Tabelle ---- */
++
+ NTSTATUS wrap_FT_SetVIDPID(void *args) {
+     struct prm_FT_SetVIDPID *a = args;
+     a->ret = FT_SetVIDPID(a->dwVID, a->dwPID);
+@@ -72,7 +121,25 @@ NTSTATUS wrap_FT_GetDeviceInfoList(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetDeviceInfoList(void *args) {
+     struct p32_FT_GetDeviceInfoList *a = args;
+-    a->ret = FT_GetDeviceInfoList((FT_DEVICE_LIST_INFO_NODE*)ULongToPtr(a->pDest), (LPDWORD)ULongToPtr(a->lpdwNumDevs));
++    FT_DEVICE_LIST_INFO_NODE32 *dst = ULongToPtr(a->pDest);
++    FT_DEVICE_LIST_INFO_NODE *tmp;
++    DWORD n = 0, i;
++    tmp = calloc(128, sizeof(*tmp));
++    if (!tmp) { a->ret = FT_INSUFFICIENT_RESOURCES; return STATUS_SUCCESS; }
++    a->ret = FT_GetDeviceInfoList(tmp, &n);
++    if (a->ret == FT_OK && dst) {
++        for (i = 0; i < n && i < 128; i++) {
++            dst[i].Flags = tmp[i].Flags;
++            dst[i].Type  = tmp[i].Type;
++            dst[i].ID    = tmp[i].ID;
++            dst[i].LocId = tmp[i].LocId;
++            memcpy(dst[i].SerialNumber, tmp[i].SerialNumber, 16);
++            memcpy(dst[i].Description,  tmp[i].Description, 64);
++            dst[i].ftHandle = h32_put(tmp[i].ftHandle);
++        }
++    }
++    if (a->lpdwNumDevs) *(DWORD *)ULongToPtr(a->lpdwNumDevs) = n;
++    free(tmp);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -84,7 +151,9 @@ NTSTATUS wrap_FT_GetDeviceInfoDetail(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetDeviceInfoDetail(void *args) {
+     struct p32_FT_GetDeviceInfoDetail *a = args;
+-    a->ret = FT_GetDeviceInfoDetail(a->dwIndex, (LPDWORD)ULongToPtr(a->lpdwFlags), (LPDWORD)ULongToPtr(a->lpdwType), (LPDWORD)ULongToPtr(a->lpdwID), (LPDWORD)ULongToPtr(a->lpdwLocId), (LPVOID)ULongToPtr(a->lpSerialNumber), (LPVOID)ULongToPtr(a->lpDescription), (FT_HANDLE*)ULongToPtr(a->pftHandle));
++    FT_HANDLE h = NULL;
++    a->ret = FT_GetDeviceInfoDetail(a->dwIndex, (LPDWORD)ULongToPtr(a->lpdwFlags), (LPDWORD)ULongToPtr(a->lpdwType), (LPDWORD)ULongToPtr(a->lpdwID), (LPDWORD)ULongToPtr(a->lpdwLocId), (LPVOID)ULongToPtr(a->lpSerialNumber), (LPVOID)ULongToPtr(a->lpDescription), &h);
++    if (a->ret == FT_OK && a->pftHandle) *(uint32_t *)ULongToPtr(a->pftHandle) = h32_put(h);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -108,7 +177,13 @@ NTSTATUS wrap_FT_Open(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_Open(void *args) {
+     struct p32_FT_Open *a = args;
+-    a->ret = FT_Open(a->deviceNumber, (FT_HANDLE*)ULongToPtr(a->pHandle));
++    FT_HANDLE h = NULL;
++    a->ret = FT_Open(a->deviceNumber, &h);
++    if (a->ret == FT_OK) {
++        uint32_t id = h32_put(h);
++        if (!id) { FT_Close(h); a->ret = FT_INSUFFICIENT_RESOURCES; }
++        else if (a->pHandle) *(uint32_t *)ULongToPtr(a->pHandle) = id;
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -120,7 +195,13 @@ NTSTATUS wrap_FT_OpenEx(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_OpenEx(void *args) {
+     struct p32_FT_OpenEx *a = args;
+-    a->ret = FT_OpenEx((PVOID)ULongToPtr(a->pvArg1), a->dwFlags, (FT_HANDLE*)ULongToPtr(a->pHandle));
++    FT_HANDLE h = NULL;
++    a->ret = FT_OpenEx((PVOID)ULongToPtr(a->pvArg1), a->dwFlags, &h);
++    if (a->ret == FT_OK) {
++        uint32_t id = h32_put(h);
++        if (!id) { FT_Close(h); a->ret = FT_INSUFFICIENT_RESOURCES; }
++        else if (a->pHandle) *(uint32_t *)ULongToPtr(a->pHandle) = id;
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -132,7 +213,8 @@ NTSTATUS wrap_FT_Close(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_Close(void *args) {
+     struct p32_FT_Close *a = args;
+-    a->ret = FT_Close((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_Close(h32_get(a->ftHandle));
++    if (a->ret == FT_OK) h32_del(a->ftHandle);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -144,7 +226,7 @@ NTSTATUS wrap_FT_Read(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_Read(void *args) {
+     struct p32_FT_Read *a = args;
+-    a->ret = FT_Read((FT_HANDLE)ULongToPtr(a->ftHandle), (LPVOID)ULongToPtr(a->lpBuffer), a->dwBytesToRead, (LPDWORD)ULongToPtr(a->lpdwBytesReturned));
++    a->ret = FT_Read(h32_get(a->ftHandle), (LPVOID)ULongToPtr(a->lpBuffer), a->dwBytesToRead, (LPDWORD)ULongToPtr(a->lpdwBytesReturned));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -156,7 +238,7 @@ NTSTATUS wrap_FT_Write(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_Write(void *args) {
+     struct p32_FT_Write *a = args;
+-    a->ret = FT_Write((FT_HANDLE)ULongToPtr(a->ftHandle), (LPVOID)ULongToPtr(a->lpBuffer), a->dwBytesToWrite, (LPDWORD)ULongToPtr(a->lpdwBytesWritten));
++    a->ret = FT_Write(h32_get(a->ftHandle), (LPVOID)ULongToPtr(a->lpBuffer), a->dwBytesToWrite, (LPDWORD)ULongToPtr(a->lpdwBytesWritten));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -168,7 +250,7 @@ NTSTATUS wrap_FT_SetBaudRate(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetBaudRate(void *args) {
+     struct p32_FT_SetBaudRate *a = args;
+-    a->ret = FT_SetBaudRate((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwBaudRate);
++    a->ret = FT_SetBaudRate(h32_get(a->ftHandle), a->dwBaudRate);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -180,7 +262,7 @@ NTSTATUS wrap_FT_SetDivisor(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetDivisor(void *args) {
+     struct p32_FT_SetDivisor *a = args;
+-    a->ret = FT_SetDivisor((FT_HANDLE)ULongToPtr(a->ftHandle), a->usDivisor);
++    a->ret = FT_SetDivisor(h32_get(a->ftHandle), a->usDivisor);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -192,7 +274,7 @@ NTSTATUS wrap_FT_SetDataCharacteristics(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetDataCharacteristics(void *args) {
+     struct p32_FT_SetDataCharacteristics *a = args;
+-    a->ret = FT_SetDataCharacteristics((FT_HANDLE)ULongToPtr(a->ftHandle), a->uWordLength, a->uStopBits, a->uParity);
++    a->ret = FT_SetDataCharacteristics(h32_get(a->ftHandle), a->uWordLength, a->uStopBits, a->uParity);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -204,7 +286,7 @@ NTSTATUS wrap_FT_SetTimeouts(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetTimeouts(void *args) {
+     struct p32_FT_SetTimeouts *a = args;
+-    a->ret = FT_SetTimeouts((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwReadTimeout, a->dwWriteTimeout);
++    a->ret = FT_SetTimeouts(h32_get(a->ftHandle), a->dwReadTimeout, a->dwWriteTimeout);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -216,7 +298,7 @@ NTSTATUS wrap_FT_SetFlowControl(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetFlowControl(void *args) {
+     struct p32_FT_SetFlowControl *a = args;
+-    a->ret = FT_SetFlowControl((FT_HANDLE)ULongToPtr(a->ftHandle), a->usFlowControl, a->uXonChar, a->uXoffChar);
++    a->ret = FT_SetFlowControl(h32_get(a->ftHandle), a->usFlowControl, a->uXonChar, a->uXoffChar);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -228,7 +310,7 @@ NTSTATUS wrap_FT_SetDtr(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetDtr(void *args) {
+     struct p32_FT_SetDtr *a = args;
+-    a->ret = FT_SetDtr((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_SetDtr(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -240,7 +322,7 @@ NTSTATUS wrap_FT_ClrDtr(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_ClrDtr(void *args) {
+     struct p32_FT_ClrDtr *a = args;
+-    a->ret = FT_ClrDtr((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_ClrDtr(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -252,7 +334,7 @@ NTSTATUS wrap_FT_SetRts(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetRts(void *args) {
+     struct p32_FT_SetRts *a = args;
+-    a->ret = FT_SetRts((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_SetRts(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -264,7 +346,7 @@ NTSTATUS wrap_FT_ClrRts(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_ClrRts(void *args) {
+     struct p32_FT_ClrRts *a = args;
+-    a->ret = FT_ClrRts((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_ClrRts(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -276,7 +358,7 @@ NTSTATUS wrap_FT_GetModemStatus(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetModemStatus(void *args) {
+     struct p32_FT_GetModemStatus *a = args;
+-    a->ret = FT_GetModemStatus((FT_HANDLE)ULongToPtr(a->ftHandle), (ULONG*)ULongToPtr(a->lpdwModemStatus));
++    a->ret = FT_GetModemStatus(h32_get(a->ftHandle), (ULONG*)ULongToPtr(a->lpdwModemStatus));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -288,7 +370,7 @@ NTSTATUS wrap_FT_GetQueueStatus(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetQueueStatus(void *args) {
+     struct p32_FT_GetQueueStatus *a = args;
+-    a->ret = FT_GetQueueStatus((FT_HANDLE)ULongToPtr(a->ftHandle), (DWORD*)ULongToPtr(a->lpdwAmountInRxQueue));
++    a->ret = FT_GetQueueStatus(h32_get(a->ftHandle), (DWORD*)ULongToPtr(a->lpdwAmountInRxQueue));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -300,7 +382,7 @@ NTSTATUS wrap_FT_GetDeviceInfo(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetDeviceInfo(void *args) {
+     struct p32_FT_GetDeviceInfo *a = args;
+-    a->ret = FT_GetDeviceInfo((FT_HANDLE)ULongToPtr(a->ftHandle), (FT_DEVICE*)ULongToPtr(a->lpftDevice), (LPDWORD)ULongToPtr(a->lpdwID), (PCHAR)ULongToPtr(a->pcSerialNumber), (PCHAR)ULongToPtr(a->pcDescription), (LPVOID)ULongToPtr(a->pvDummy));
++    a->ret = FT_GetDeviceInfo(h32_get(a->ftHandle), (FT_DEVICE*)ULongToPtr(a->lpftDevice), (LPDWORD)ULongToPtr(a->lpdwID), (PCHAR)ULongToPtr(a->pcSerialNumber), (PCHAR)ULongToPtr(a->pcDescription), (LPVOID)ULongToPtr(a->pvDummy));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -312,7 +394,7 @@ NTSTATUS wrap_FT_GetDeviceLocId(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetDeviceLocId(void *args) {
+     struct p32_FT_GetDeviceLocId *a = args;
+-    a->ret = FT_GetDeviceLocId((FT_HANDLE)ULongToPtr(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwLocId));
++    a->ret = FT_GetDeviceLocId(h32_get(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwLocId));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -324,7 +406,7 @@ NTSTATUS wrap_FT_GetDriverVersion(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetDriverVersion(void *args) {
+     struct p32_FT_GetDriverVersion *a = args;
+-    a->ret = FT_GetDriverVersion((FT_HANDLE)ULongToPtr(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwDriverVersion));
++    a->ret = FT_GetDriverVersion(h32_get(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwDriverVersion));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -348,7 +430,7 @@ NTSTATUS wrap_FT_GetComPortNumber(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetComPortNumber(void *args) {
+     struct p32_FT_GetComPortNumber *a = args;
+-    a->ret = FT_GetComPortNumber((FT_HANDLE)ULongToPtr(a->ftHandle), (LPLONG)ULongToPtr(a->lplComPortNumber));
++    a->ret = FT_GetComPortNumber(h32_get(a->ftHandle), (LPLONG)ULongToPtr(a->lplComPortNumber));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -360,7 +442,7 @@ NTSTATUS wrap_FT_GetStatus(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetStatus(void *args) {
+     struct p32_FT_GetStatus *a = args;
+-    a->ret = FT_GetStatus((FT_HANDLE)ULongToPtr(a->ftHandle), (DWORD*)ULongToPtr(a->lpdwAmountInRxQueue), (DWORD*)ULongToPtr(a->lpdwAmountInTxQueue), (DWORD*)ULongToPtr(a->lpdwEventStatus));
++    a->ret = FT_GetStatus(h32_get(a->ftHandle), (DWORD*)ULongToPtr(a->lpdwAmountInRxQueue), (DWORD*)ULongToPtr(a->lpdwAmountInTxQueue), (DWORD*)ULongToPtr(a->lpdwEventStatus));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -372,7 +454,7 @@ NTSTATUS wrap_FT_SetEventNotification(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetEventNotification(void *args) {
+     struct p32_FT_SetEventNotification *a = args;
+-    a->ret = FT_SetEventNotification((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwEventMask, (PVOID)ULongToPtr(a->pvArg));
++    a->ret = FT_SetEventNotification(h32_get(a->ftHandle), a->dwEventMask, (PVOID)ULongToPtr(a->pvArg));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -384,7 +466,7 @@ NTSTATUS wrap_FT_SetChars(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetChars(void *args) {
+     struct p32_FT_SetChars *a = args;
+-    a->ret = FT_SetChars((FT_HANDLE)ULongToPtr(a->ftHandle), a->uEventChar, a->uEventCharEnabled, a->uErrorChar, a->uErrorCharEnabled);
++    a->ret = FT_SetChars(h32_get(a->ftHandle), a->uEventChar, a->uEventCharEnabled, a->uErrorChar, a->uErrorCharEnabled);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -396,7 +478,7 @@ NTSTATUS wrap_FT_SetBreakOn(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetBreakOn(void *args) {
+     struct p32_FT_SetBreakOn *a = args;
+-    a->ret = FT_SetBreakOn((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_SetBreakOn(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -408,7 +490,7 @@ NTSTATUS wrap_FT_SetBreakOff(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetBreakOff(void *args) {
+     struct p32_FT_SetBreakOff *a = args;
+-    a->ret = FT_SetBreakOff((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_SetBreakOff(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -420,7 +502,7 @@ NTSTATUS wrap_FT_Purge(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_Purge(void *args) {
+     struct p32_FT_Purge *a = args;
+-    a->ret = FT_Purge((FT_HANDLE)ULongToPtr(a->ftHandle), a->ulMask);
++    a->ret = FT_Purge(h32_get(a->ftHandle), a->ulMask);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -432,7 +514,7 @@ NTSTATUS wrap_FT_ResetDevice(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_ResetDevice(void *args) {
+     struct p32_FT_ResetDevice *a = args;
+-    a->ret = FT_ResetDevice((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_ResetDevice(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -444,7 +526,7 @@ NTSTATUS wrap_FT_ResetPort(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_ResetPort(void *args) {
+     struct p32_FT_ResetPort *a = args;
+-    a->ret = FT_ResetPort((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_ResetPort(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -456,7 +538,7 @@ NTSTATUS wrap_FT_CyclePort(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_CyclePort(void *args) {
+     struct p32_FT_CyclePort *a = args;
+-    a->ret = FT_CyclePort((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_CyclePort(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -492,7 +574,7 @@ NTSTATUS wrap_FT_SetResetPipeRetryCount(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetResetPipeRetryCount(void *args) {
+     struct p32_FT_SetResetPipeRetryCount *a = args;
+-    a->ret = FT_SetResetPipeRetryCount((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwCount);
++    a->ret = FT_SetResetPipeRetryCount(h32_get(a->ftHandle), a->dwCount);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -504,7 +586,7 @@ NTSTATUS wrap_FT_StopInTask(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_StopInTask(void *args) {
+     struct p32_FT_StopInTask *a = args;
+-    a->ret = FT_StopInTask((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_StopInTask(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -516,7 +598,7 @@ NTSTATUS wrap_FT_RestartInTask(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_RestartInTask(void *args) {
+     struct p32_FT_RestartInTask *a = args;
+-    a->ret = FT_RestartInTask((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_RestartInTask(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -528,7 +610,7 @@ NTSTATUS wrap_FT_SetDeadmanTimeout(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetDeadmanTimeout(void *args) {
+     struct p32_FT_SetDeadmanTimeout *a = args;
+-    a->ret = FT_SetDeadmanTimeout((FT_HANDLE)ULongToPtr(a->ftHandle), a->ulDeadmanTimeout);
++    a->ret = FT_SetDeadmanTimeout(h32_get(a->ftHandle), a->ulDeadmanTimeout);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -540,7 +622,7 @@ NTSTATUS wrap_FT_IoCtl(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_IoCtl(void *args) {
+     struct p32_FT_IoCtl *a = args;
+-    a->ret = FT_IoCtl((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwIoControlCode, (LPVOID)ULongToPtr(a->lpInBuf), a->nInBufSize, (LPVOID)ULongToPtr(a->lpOutBuf), a->nOutBufSize, (LPDWORD)ULongToPtr(a->lpBytesReturned), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped));
++    a->ret = FT_IoCtl(h32_get(a->ftHandle), a->dwIoControlCode, (LPVOID)ULongToPtr(a->lpInBuf), a->nInBufSize, (LPVOID)ULongToPtr(a->lpOutBuf), a->nOutBufSize, (LPDWORD)ULongToPtr(a->lpBytesReturned), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -552,7 +634,7 @@ NTSTATUS wrap_FT_SetWaitMask(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetWaitMask(void *args) {
+     struct p32_FT_SetWaitMask *a = args;
+-    a->ret = FT_SetWaitMask((FT_HANDLE)ULongToPtr(a->ftHandle), a->Mask);
++    a->ret = FT_SetWaitMask(h32_get(a->ftHandle), a->Mask);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -564,7 +646,7 @@ NTSTATUS wrap_FT_WaitOnMask(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_WaitOnMask(void *args) {
+     struct p32_FT_WaitOnMask *a = args;
+-    a->ret = FT_WaitOnMask((FT_HANDLE)ULongToPtr(a->ftHandle), (DWORD*)ULongToPtr(a->Mask));
++    a->ret = FT_WaitOnMask(h32_get(a->ftHandle), (DWORD*)ULongToPtr(a->Mask));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -576,7 +658,7 @@ NTSTATUS wrap_FT_GetEventStatus(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetEventStatus(void *args) {
+     struct p32_FT_GetEventStatus *a = args;
+-    a->ret = FT_GetEventStatus((FT_HANDLE)ULongToPtr(a->ftHandle), (DWORD*)ULongToPtr(a->dwEventDWord));
++    a->ret = FT_GetEventStatus(h32_get(a->ftHandle), (DWORD*)ULongToPtr(a->dwEventDWord));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -588,7 +670,7 @@ NTSTATUS wrap_FT_ReadEE(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_ReadEE(void *args) {
+     struct p32_FT_ReadEE *a = args;
+-    a->ret = FT_ReadEE((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwWordOffset, (LPWORD)ULongToPtr(a->lpwValue));
++    a->ret = FT_ReadEE(h32_get(a->ftHandle), a->dwWordOffset, (LPWORD)ULongToPtr(a->lpwValue));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -600,7 +682,7 @@ NTSTATUS wrap_FT_WriteEE(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_WriteEE(void *args) {
+     struct p32_FT_WriteEE *a = args;
+-    a->ret = FT_WriteEE((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwWordOffset, a->wValue);
++    a->ret = FT_WriteEE(h32_get(a->ftHandle), a->dwWordOffset, a->wValue);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -612,7 +694,7 @@ NTSTATUS wrap_FT_EraseEE(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EraseEE(void *args) {
+     struct p32_FT_EraseEE *a = args;
+-    a->ret = FT_EraseEE((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_EraseEE(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -624,7 +706,7 @@ NTSTATUS wrap_FT_EE_Read(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_Read(void *args) {
+     struct p32_FT_EE_Read *a = args;
+-    a->ret = FT_EE_Read((FT_HANDLE)ULongToPtr(a->ftHandle), (PFT_PROGRAM_DATA)ULongToPtr(a->pData));
++    a->ret = FT_EE_Read(h32_get(a->ftHandle), (PFT_PROGRAM_DATA)ULongToPtr(a->pData));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -636,7 +718,7 @@ NTSTATUS wrap_FT_EE_ReadEx(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_ReadEx(void *args) {
+     struct p32_FT_EE_ReadEx *a = args;
+-    a->ret = FT_EE_ReadEx((FT_HANDLE)ULongToPtr(a->ftHandle), (PFT_PROGRAM_DATA)ULongToPtr(a->pData), (char*)ULongToPtr(a->Manufacturer), (char*)ULongToPtr(a->ManufacturerId), (char*)ULongToPtr(a->Description), (char*)ULongToPtr(a->SerialNumber));
++    a->ret = FT_EE_ReadEx(h32_get(a->ftHandle), (PFT_PROGRAM_DATA)ULongToPtr(a->pData), (char*)ULongToPtr(a->Manufacturer), (char*)ULongToPtr(a->ManufacturerId), (char*)ULongToPtr(a->Description), (char*)ULongToPtr(a->SerialNumber));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -648,7 +730,7 @@ NTSTATUS wrap_FT_EE_Program(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_Program(void *args) {
+     struct p32_FT_EE_Program *a = args;
+-    a->ret = FT_EE_Program((FT_HANDLE)ULongToPtr(a->ftHandle), (PFT_PROGRAM_DATA)ULongToPtr(a->pData));
++    a->ret = FT_EE_Program(h32_get(a->ftHandle), (PFT_PROGRAM_DATA)ULongToPtr(a->pData));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -660,7 +742,7 @@ NTSTATUS wrap_FT_EE_ProgramEx(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_ProgramEx(void *args) {
+     struct p32_FT_EE_ProgramEx *a = args;
+-    a->ret = FT_EE_ProgramEx((FT_HANDLE)ULongToPtr(a->ftHandle), (PFT_PROGRAM_DATA)ULongToPtr(a->pData), (char*)ULongToPtr(a->Manufacturer), (char*)ULongToPtr(a->ManufacturerId), (char*)ULongToPtr(a->Description), (char*)ULongToPtr(a->SerialNumber));
++    a->ret = FT_EE_ProgramEx(h32_get(a->ftHandle), (PFT_PROGRAM_DATA)ULongToPtr(a->pData), (char*)ULongToPtr(a->Manufacturer), (char*)ULongToPtr(a->ManufacturerId), (char*)ULongToPtr(a->Description), (char*)ULongToPtr(a->SerialNumber));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -672,7 +754,7 @@ NTSTATUS wrap_FT_EE_UASize(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_UASize(void *args) {
+     struct p32_FT_EE_UASize *a = args;
+-    a->ret = FT_EE_UASize((FT_HANDLE)ULongToPtr(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwSize));
++    a->ret = FT_EE_UASize(h32_get(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwSize));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -684,7 +766,7 @@ NTSTATUS wrap_FT_EE_UARead(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_UARead(void *args) {
+     struct p32_FT_EE_UARead *a = args;
+-    a->ret = FT_EE_UARead((FT_HANDLE)ULongToPtr(a->ftHandle), (PUCHAR)ULongToPtr(a->pucData), a->dwDataLen, (LPDWORD)ULongToPtr(a->lpdwBytesRead));
++    a->ret = FT_EE_UARead(h32_get(a->ftHandle), (PUCHAR)ULongToPtr(a->pucData), a->dwDataLen, (LPDWORD)ULongToPtr(a->lpdwBytesRead));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -696,7 +778,7 @@ NTSTATUS wrap_FT_EE_UAWrite(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_UAWrite(void *args) {
+     struct p32_FT_EE_UAWrite *a = args;
+-    a->ret = FT_EE_UAWrite((FT_HANDLE)ULongToPtr(a->ftHandle), (PUCHAR)ULongToPtr(a->pucData), a->dwDataLen);
++    a->ret = FT_EE_UAWrite(h32_get(a->ftHandle), (PUCHAR)ULongToPtr(a->pucData), a->dwDataLen);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -708,7 +790,7 @@ NTSTATUS wrap_FT_EEPROM_Read(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EEPROM_Read(void *args) {
+     struct p32_FT_EEPROM_Read *a = args;
+-    a->ret = FT_EEPROM_Read((FT_HANDLE)ULongToPtr(a->ftHandle), (void*)ULongToPtr(a->eepromData), a->eepromDataSize, (char*)ULongToPtr(a->Manufacturer), (char*)ULongToPtr(a->ManufacturerId), (char*)ULongToPtr(a->Description), (char*)ULongToPtr(a->SerialNumber));
++    a->ret = FT_EEPROM_Read(h32_get(a->ftHandle), (void*)ULongToPtr(a->eepromData), a->eepromDataSize, (char*)ULongToPtr(a->Manufacturer), (char*)ULongToPtr(a->ManufacturerId), (char*)ULongToPtr(a->Description), (char*)ULongToPtr(a->SerialNumber));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -720,7 +802,7 @@ NTSTATUS wrap_FT_EEPROM_Program(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EEPROM_Program(void *args) {
+     struct p32_FT_EEPROM_Program *a = args;
+-    a->ret = FT_EEPROM_Program((FT_HANDLE)ULongToPtr(a->ftHandle), (void*)ULongToPtr(a->eepromData), a->eepromDataSize, (char*)ULongToPtr(a->Manufacturer), (char*)ULongToPtr(a->ManufacturerId), (char*)ULongToPtr(a->Description), (char*)ULongToPtr(a->SerialNumber));
++    a->ret = FT_EEPROM_Program(h32_get(a->ftHandle), (void*)ULongToPtr(a->eepromData), a->eepromDataSize, (char*)ULongToPtr(a->Manufacturer), (char*)ULongToPtr(a->ManufacturerId), (char*)ULongToPtr(a->Description), (char*)ULongToPtr(a->SerialNumber));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -732,7 +814,7 @@ NTSTATUS wrap_FT_SetLatencyTimer(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetLatencyTimer(void *args) {
+     struct p32_FT_SetLatencyTimer *a = args;
+-    a->ret = FT_SetLatencyTimer((FT_HANDLE)ULongToPtr(a->ftHandle), a->ucLatency);
++    a->ret = FT_SetLatencyTimer(h32_get(a->ftHandle), a->ucLatency);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -744,7 +826,7 @@ NTSTATUS wrap_FT_GetLatencyTimer(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetLatencyTimer(void *args) {
+     struct p32_FT_GetLatencyTimer *a = args;
+-    a->ret = FT_GetLatencyTimer((FT_HANDLE)ULongToPtr(a->ftHandle), (PUCHAR)ULongToPtr(a->pucLatency));
++    a->ret = FT_GetLatencyTimer(h32_get(a->ftHandle), (PUCHAR)ULongToPtr(a->pucLatency));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -756,7 +838,7 @@ NTSTATUS wrap_FT_SetBitMode(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetBitMode(void *args) {
+     struct p32_FT_SetBitMode *a = args;
+-    a->ret = FT_SetBitMode((FT_HANDLE)ULongToPtr(a->ftHandle), a->ucMask, a->ucEnable);
++    a->ret = FT_SetBitMode(h32_get(a->ftHandle), a->ucMask, a->ucEnable);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -768,7 +850,7 @@ NTSTATUS wrap_FT_GetBitMode(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetBitMode(void *args) {
+     struct p32_FT_GetBitMode *a = args;
+-    a->ret = FT_GetBitMode((FT_HANDLE)ULongToPtr(a->ftHandle), (PUCHAR)ULongToPtr(a->pucMode));
++    a->ret = FT_GetBitMode(h32_get(a->ftHandle), (PUCHAR)ULongToPtr(a->pucMode));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -780,7 +862,7 @@ NTSTATUS wrap_FT_SetUSBParameters(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_SetUSBParameters(void *args) {
+     struct p32_FT_SetUSBParameters *a = args;
+-    a->ret = FT_SetUSBParameters((FT_HANDLE)ULongToPtr(a->ftHandle), a->ulInTransferSize, a->ulOutTransferSize);
++    a->ret = FT_SetUSBParameters(h32_get(a->ftHandle), a->ulInTransferSize, a->ulOutTransferSize);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -804,7 +886,7 @@ NTSTATUS wrap_FT_W32_CloseHandle(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_CloseHandle(void *args) {
+     struct p32_FT_W32_CloseHandle *a = args;
+-    a->ret = FT_W32_CloseHandle((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_W32_CloseHandle(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -816,7 +898,7 @@ NTSTATUS wrap_FT_W32_ReadFile(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_ReadFile(void *args) {
+     struct p32_FT_W32_ReadFile *a = args;
+-    a->ret = FT_W32_ReadFile((FT_HANDLE)ULongToPtr(a->ftHandle), (LPVOID)ULongToPtr(a->lpBuffer), a->nBufferSize, (LPDWORD)ULongToPtr(a->lpdwBytesReturned), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped));
++    a->ret = FT_W32_ReadFile(h32_get(a->ftHandle), (LPVOID)ULongToPtr(a->lpBuffer), a->nBufferSize, (LPDWORD)ULongToPtr(a->lpdwBytesReturned), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -828,7 +910,7 @@ NTSTATUS wrap_FT_W32_WriteFile(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_WriteFile(void *args) {
+     struct p32_FT_W32_WriteFile *a = args;
+-    a->ret = FT_W32_WriteFile((FT_HANDLE)ULongToPtr(a->ftHandle), (LPVOID)ULongToPtr(a->lpBuffer), a->nBufferSize, (LPDWORD)ULongToPtr(a->lpdwBytesWritten), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped));
++    a->ret = FT_W32_WriteFile(h32_get(a->ftHandle), (LPVOID)ULongToPtr(a->lpBuffer), a->nBufferSize, (LPDWORD)ULongToPtr(a->lpdwBytesWritten), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -840,7 +922,7 @@ NTSTATUS wrap_FT_W32_GetOverlappedResult(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_GetOverlappedResult(void *args) {
+     struct p32_FT_W32_GetOverlappedResult *a = args;
+-    a->ret = FT_W32_GetOverlappedResult((FT_HANDLE)ULongToPtr(a->ftHandle), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped), (LPDWORD)ULongToPtr(a->lpdwBytesTransferred), a->bWait);
++    a->ret = FT_W32_GetOverlappedResult(h32_get(a->ftHandle), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped), (LPDWORD)ULongToPtr(a->lpdwBytesTransferred), a->bWait);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -852,7 +934,7 @@ NTSTATUS wrap_FT_W32_EscapeCommFunction(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_EscapeCommFunction(void *args) {
+     struct p32_FT_W32_EscapeCommFunction *a = args;
+-    a->ret = FT_W32_EscapeCommFunction((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwFunc);
++    a->ret = FT_W32_EscapeCommFunction(h32_get(a->ftHandle), a->dwFunc);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -864,7 +946,7 @@ NTSTATUS wrap_FT_W32_GetCommModemStatus(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_GetCommModemStatus(void *args) {
+     struct p32_FT_W32_GetCommModemStatus *a = args;
+-    a->ret = FT_W32_GetCommModemStatus((FT_HANDLE)ULongToPtr(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwModemStatus));
++    a->ret = FT_W32_GetCommModemStatus(h32_get(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwModemStatus));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -876,7 +958,7 @@ NTSTATUS wrap_FT_W32_SetupComm(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_SetupComm(void *args) {
+     struct p32_FT_W32_SetupComm *a = args;
+-    a->ret = FT_W32_SetupComm((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwReadBufferSize, a->dwWriteBufferSize);
++    a->ret = FT_W32_SetupComm(h32_get(a->ftHandle), a->dwReadBufferSize, a->dwWriteBufferSize);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -888,7 +970,7 @@ NTSTATUS wrap_FT_W32_SetCommState(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_SetCommState(void *args) {
+     struct p32_FT_W32_SetCommState *a = args;
+-    a->ret = FT_W32_SetCommState((FT_HANDLE)ULongToPtr(a->ftHandle), (LPFTDCB)ULongToPtr(a->lpftDcb));
++    a->ret = FT_W32_SetCommState(h32_get(a->ftHandle), (LPFTDCB)ULongToPtr(a->lpftDcb));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -900,7 +982,7 @@ NTSTATUS wrap_FT_W32_GetCommState(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_GetCommState(void *args) {
+     struct p32_FT_W32_GetCommState *a = args;
+-    a->ret = FT_W32_GetCommState((FT_HANDLE)ULongToPtr(a->ftHandle), (LPFTDCB)ULongToPtr(a->lpftDcb));
++    a->ret = FT_W32_GetCommState(h32_get(a->ftHandle), (LPFTDCB)ULongToPtr(a->lpftDcb));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -912,7 +994,7 @@ NTSTATUS wrap_FT_W32_SetCommTimeouts(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_SetCommTimeouts(void *args) {
+     struct p32_FT_W32_SetCommTimeouts *a = args;
+-    a->ret = FT_W32_SetCommTimeouts((FT_HANDLE)ULongToPtr(a->ftHandle), (FTTIMEOUTS*)ULongToPtr(a->pftTimeouts));
++    a->ret = FT_W32_SetCommTimeouts(h32_get(a->ftHandle), (FTTIMEOUTS*)ULongToPtr(a->pftTimeouts));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -924,7 +1006,7 @@ NTSTATUS wrap_FT_W32_GetCommTimeouts(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_GetCommTimeouts(void *args) {
+     struct p32_FT_W32_GetCommTimeouts *a = args;
+-    a->ret = FT_W32_GetCommTimeouts((FT_HANDLE)ULongToPtr(a->ftHandle), (FTTIMEOUTS*)ULongToPtr(a->pftTimeouts));
++    a->ret = FT_W32_GetCommTimeouts(h32_get(a->ftHandle), (FTTIMEOUTS*)ULongToPtr(a->pftTimeouts));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -936,7 +1018,7 @@ NTSTATUS wrap_FT_W32_SetCommBreak(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_SetCommBreak(void *args) {
+     struct p32_FT_W32_SetCommBreak *a = args;
+-    a->ret = FT_W32_SetCommBreak((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_W32_SetCommBreak(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -948,7 +1030,7 @@ NTSTATUS wrap_FT_W32_ClearCommBreak(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_ClearCommBreak(void *args) {
+     struct p32_FT_W32_ClearCommBreak *a = args;
+-    a->ret = FT_W32_ClearCommBreak((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_W32_ClearCommBreak(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -960,7 +1042,7 @@ NTSTATUS wrap_FT_W32_SetCommMask(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_SetCommMask(void *args) {
+     struct p32_FT_W32_SetCommMask *a = args;
+-    a->ret = FT_W32_SetCommMask((FT_HANDLE)ULongToPtr(a->ftHandle), a->ulEventMask);
++    a->ret = FT_W32_SetCommMask(h32_get(a->ftHandle), a->ulEventMask);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -972,7 +1054,7 @@ NTSTATUS wrap_FT_W32_WaitCommEvent(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_WaitCommEvent(void *args) {
+     struct p32_FT_W32_WaitCommEvent *a = args;
+-    a->ret = FT_W32_WaitCommEvent((FT_HANDLE)ULongToPtr(a->ftHandle), (PULONG)ULongToPtr(a->pulEvent), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped));
++    a->ret = FT_W32_WaitCommEvent(h32_get(a->ftHandle), (PULONG)ULongToPtr(a->pulEvent), (LPOVERLAPPED)ULongToPtr(a->lpOverlapped));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -984,7 +1066,7 @@ NTSTATUS wrap_FT_W32_PurgeComm(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_PurgeComm(void *args) {
+     struct p32_FT_W32_PurgeComm *a = args;
+-    a->ret = FT_W32_PurgeComm((FT_HANDLE)ULongToPtr(a->ftHandle), a->dwMask);
++    a->ret = FT_W32_PurgeComm(h32_get(a->ftHandle), a->dwMask);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -996,7 +1078,7 @@ NTSTATUS wrap_FT_W32_ClearCommError(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_ClearCommError(void *args) {
+     struct p32_FT_W32_ClearCommError *a = args;
+-    a->ret = FT_W32_ClearCommError((FT_HANDLE)ULongToPtr(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwErrors), (LPFTCOMSTAT)ULongToPtr(a->lpftComstat));
++    a->ret = FT_W32_ClearCommError(h32_get(a->ftHandle), (LPDWORD)ULongToPtr(a->lpdwErrors), (LPFTCOMSTAT)ULongToPtr(a->lpftComstat));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1008,7 +1090,7 @@ NTSTATUS wrap_FT_W32_CancelIo(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_W32_CancelIo(void *args) {
+     struct p32_FT_W32_CancelIo *a = args;
+-    a->ret = FT_W32_CancelIo((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_W32_CancelIo(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1020,7 +1102,7 @@ NTSTATUS wrap_FT_EE_ReadConfig(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_ReadConfig(void *args) {
+     struct p32_FT_EE_ReadConfig *a = args;
+-    a->ret = FT_EE_ReadConfig((FT_HANDLE)ULongToPtr(a->ftHandle), a->ucAddress, (PUCHAR)ULongToPtr(a->pucValue));
++    a->ret = FT_EE_ReadConfig(h32_get(a->ftHandle), a->ucAddress, (PUCHAR)ULongToPtr(a->pucValue));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1032,7 +1114,7 @@ NTSTATUS wrap_FT_EE_WriteConfig(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_WriteConfig(void *args) {
+     struct p32_FT_EE_WriteConfig *a = args;
+-    a->ret = FT_EE_WriteConfig((FT_HANDLE)ULongToPtr(a->ftHandle), a->ucAddress, a->ucValue);
++    a->ret = FT_EE_WriteConfig(h32_get(a->ftHandle), a->ucAddress, a->ucValue);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1044,7 +1126,7 @@ NTSTATUS wrap_FT_EE_ReadECC(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_EE_ReadECC(void *args) {
+     struct p32_FT_EE_ReadECC *a = args;
+-    a->ret = FT_EE_ReadECC((FT_HANDLE)ULongToPtr(a->ftHandle), a->ucOption, (LPWORD)ULongToPtr(a->lpwValue));
++    a->ret = FT_EE_ReadECC(h32_get(a->ftHandle), a->ucOption, (LPWORD)ULongToPtr(a->lpwValue));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1056,7 +1138,7 @@ NTSTATUS wrap_FT_GetQueueStatusEx(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_GetQueueStatusEx(void *args) {
+     struct p32_FT_GetQueueStatusEx *a = args;
+-    a->ret = FT_GetQueueStatusEx((FT_HANDLE)ULongToPtr(a->ftHandle), (DWORD*)ULongToPtr(a->dwRxBytes));
++    a->ret = FT_GetQueueStatusEx(h32_get(a->ftHandle), (DWORD*)ULongToPtr(a->dwRxBytes));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1068,7 +1150,7 @@ NTSTATUS wrap_FT_ComPortIdle(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_ComPortIdle(void *args) {
+     struct p32_FT_ComPortIdle *a = args;
+-    a->ret = FT_ComPortIdle((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_ComPortIdle(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1080,7 +1162,7 @@ NTSTATUS wrap_FT_ComPortCancelIdle(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_ComPortCancelIdle(void *args) {
+     struct p32_FT_ComPortCancelIdle *a = args;
+-    a->ret = FT_ComPortCancelIdle((FT_HANDLE)ULongToPtr(a->ftHandle));
++    a->ret = FT_ComPortCancelIdle(h32_get(a->ftHandle));
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1092,7 +1174,7 @@ NTSTATUS wrap_FT_VendorCmdGet(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_VendorCmdGet(void *args) {
+     struct p32_FT_VendorCmdGet *a = args;
+-    a->ret = FT_VendorCmdGet((FT_HANDLE)ULongToPtr(a->ftHandle), a->Request, (UCHAR*)ULongToPtr(a->Buf), a->Len);
++    a->ret = FT_VendorCmdGet(h32_get(a->ftHandle), a->Request, (UCHAR*)ULongToPtr(a->Buf), a->Len);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1104,7 +1186,7 @@ NTSTATUS wrap_FT_VendorCmdSet(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_VendorCmdSet(void *args) {
+     struct p32_FT_VendorCmdSet *a = args;
+-    a->ret = FT_VendorCmdSet((FT_HANDLE)ULongToPtr(a->ftHandle), a->Request, (UCHAR*)ULongToPtr(a->Buf), a->Len);
++    a->ret = FT_VendorCmdSet(h32_get(a->ftHandle), a->Request, (UCHAR*)ULongToPtr(a->Buf), a->Len);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1116,7 +1198,7 @@ NTSTATUS wrap_FT_VendorCmdGetEx(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_VendorCmdGetEx(void *args) {
+     struct p32_FT_VendorCmdGetEx *a = args;
+-    a->ret = FT_VendorCmdGetEx((FT_HANDLE)ULongToPtr(a->ftHandle), a->wValue, (UCHAR*)ULongToPtr(a->Buf), a->Len);
++    a->ret = FT_VendorCmdGetEx(h32_get(a->ftHandle), a->wValue, (UCHAR*)ULongToPtr(a->Buf), a->Len);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1128,7 +1210,7 @@ NTSTATUS wrap_FT_VendorCmdSetEx(void *args) {
+ 
+ NTSTATUS wow64_wrap_FT_VendorCmdSetEx(void *args) {
+     struct p32_FT_VendorCmdSetEx *a = args;
+-    a->ret = FT_VendorCmdSetEx((FT_HANDLE)ULongToPtr(a->ftHandle), a->wValue, (UCHAR*)ULongToPtr(a->Buf), a->Len);
++    a->ret = FT_VendorCmdSetEx(h32_get(a->ftHandle), a->wValue, (UCHAR*)ULongToPtr(a->Buf), a->Len);
+     return STATUS_SUCCESS;
+ }
+ 

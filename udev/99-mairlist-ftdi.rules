@@ -1,0 +1,7 @@
+# mAirList FTDI-Dongle: Zugriff für Benutzer (libftd2xx via libusb)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", MODE="0666", TAG+="uaccess"
+# Nur den mAirList-Dongle ("FTDI USB-Key") vom seriellen Kernel-Treiber lösen,
+# damit der D2XX-Treiber ihn öffnen kann. Andere FTDI-Adapter bleiben /dev/ttyUSB*.
+# Wichtig: "bind" statt "add" – beim Booten lädt ftdi_sio erst NACH dem add-Ereignis.
+ACTION=="bind", SUBSYSTEM=="usb", DRIVER=="ftdi_sio", ATTRS{idVendor}=="0403", ATTRS{product}=="FTDI USB-Key", RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/ftdi_sio/unbind'"
