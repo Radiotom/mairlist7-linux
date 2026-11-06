@@ -54,6 +54,28 @@ Das Skript fragt einmal nach deinem `sudo`-Passwort und erledigt dann alles
 3. mAirList über das Startmenü starten (*Wine → Programs → mAirList 7*).
 4. Lizenz aktivieren (siehe unten).
 
+## ⚠️ Wichtig: nach Systemupdates
+
+Die FTDI-Brücke (`ftd2xx.so` / `ftd2xx.dll`) wird gegen die installierte
+Wine-Version gebaut. Wenn nach einem Systemupdate (`sudo pacman -Syu`) mit
+einer **neuen Wine-Version** die Lizenz nicht mehr erkannt wird (mAirList
+startet im Demo-Modus, der Dongle fehlt im Lizenzmanager), muss die Brücke
+**neu gebaut** werden. Dafür einfach das Installationsskript erneut ausführen:
+
+```bash
+cd mairlist7-linux
+git pull
+./install.sh
+```
+
+Deine mAirList-Einstellungen, die Lizenz und die Datenbanken bleiben dabei
+erhalten. Das Skript baut die Brücke neu und installiert mAirList über die
+bestehende Installation.
+
+Die installierte Wine-Version zeigt `wine --version` an. Wer Überraschungen
+vermeiden will, prüft nach jedem Update kurz mit dem Dongle-Test (siehe oben),
+ob der Dongle noch erkannt wird.
+
 ## Wie es funktioniert
 
 ### Das Dongle-Problem
